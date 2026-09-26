@@ -1,0 +1,317 @@
+import sqlite3
+import hashlib
+import os
+from datetime import datetime
+
+# ---------- DATABASE SETUP ----------
+conn = sqlite3.connect("stocksense.db")
+c = conn.cursor()
+
+c.execute("""CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT,
+    email TEXT UNIQUE,
+    password_hash TEXT,
+    salt TEXT
+)""")
+
+c.execute("""CREATE TABLE IF NOT EXISTS products (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT,
+    stock INTEGER DEFAULT 0,
+    damaged INTEGER DEFAULT 0,
+    location TEXT
+)""")
+
+c.execute("""CREATE TABLE IF NOT EXISTS movements (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    product_id INTEGER,
+    type TEXT,
+    quantity INTEGER,
+    party TEXT,
+    location TEXT,
+    date TEXT
+)""")
+conn.commit()
+
+current_user = None
+
+
+# ---------- HELPERS ----------
+def hash_password(password: str, salt: str = None):
+    """Return (hash, salt) using PBKDF2-HMAC-SHA256."""
+    if salt is None:
+        salt = os.urandom(16).hex()
+    pw_hash = hashlib.pbkdf2_hmac(
+        "sha256", password.encode(), bytes.fromhex(salt), 100_000
+    ).hex()
+    return pw_hash, salt
+
+
+def prompt_int(label, allow_blank=False):
+    """Prompt until a valid integer is entered."""
+    while True:
+        raw = input(label).strip()
+        if allow_blank and raw == "":
+            return None
+        try:
+            return int(raw)
+        except ValueError:
+            print("Please enter a whole number.")
+
+
+def product_exists(pid):
+    c.execute("SELECT 1 FROM products WHERE id=?", (pid,))
+    return c.fetchone() is not None
+
+
+def get_product_id():
+    """Prompt for a product ID and re-prompt until it exists (or user cancels)."""
+    while True:
+        pid = prompt_int("Enter product ID (blank to cancel): ", allow_blank=True)
+        if pid is None:
+            return None
+        if product_exists(pid):
+            return pid
+        print("No product with that ID. Try again.")
+
+
+# ---------- AUTH ----------
+def sign_up():
+    name = input("Name: ").strip()
+    email = input("Email: ").strip().lower()
+    password = input("Password: ")
+    if not password:
+        print("Password cannot be empty.")
+        return
+    pw_hash, salt = hash_password(password)
+    try:
+        c.execute(
+            "INSERT INTO users (name, email, password_hash, salt) VALUES (?, ?, ?, ?)",
+            (name, email, pw_hash, salt),
+        )
+        conn.commit()
+        print("Account created! Please login.")
+    except sqlite3.IntegrityError:
+        print("Email already registered.")
+
+
+def sign_in():
+    global current_user
+    email = input("Email: ").strip().lower()
+    password = input("Password: ")
+    c.execute("SELECT id, name, email, password_hash, salt FROM users WHERE email=?", (email,))
+    user = c.fetchone()
+    if user:
+        stored_hash = user[3]
+        salt = user[4]
+        attempt_hash, _ = hash_password(password, salt)
+        if attempt_hash == stored_hash:
+            current_user = user
+            print(f"Welcome back, {user[1]}!")
+            return True
+    print("Invalid email or password.")
+    return False
+
+
+# ---------- INVENTORY FUNCTIONS ----------
+def add_product():
+    name = input("Product name: ").strip()
+    if not name:
+        print("Product name cannot be empty.")
+        return
+    location = input("Warehouse/Rack location: ").strip()
+    c.execute("INSERT INTO products (name, stock, damaged, location) VALUES (?, 0, 0, ?)", (name, location))
+    conn.commit()
+    print(f"Product '{name}' added at {location}.")
+
+
+def receive_goods():
+    show_products()
+    pid = get_product_id()
+    if pid is None:
+        return
+    qty = prompt_int("Quantity received: ")
+    if qty <= 0:
+        print("Quantity must be positive.")
+        return
+    supplier = input("Received from (supplier/vendor name): ").strip()
+    c.execute("UPDATE products SET stock = stock + ? WHERE id=?", (qty, pid))
+    log_movement(pid, "RECEIVED", qty, supplier)
+    print(f"Stock increased by {qty} (from {supplier}).")
+
+
+def sell_goods():
+    show_products()
+    pid = get_product_id()
+    if pid is None:
+        return
+    qty = prompt_int("Quantity sold: ")
+    if qty <= 0:
+        print("Quantity must be positive.")
+        return
+    customer = input("Sold to (customer name): ").strip()
+    c.execute("SELECT stock FROM products WHERE id=?", (pid,))
+    stock = c.fetchone()[0]
+    if stock < qty:
+        print(f"Not enough stock! Only {stock} available.")
+        return
+    c.execute("UPDATE products SET stock = stock - ? WHERE id=?", (qty, pid))
+    log_movement(pid, "SOLD", qty, customer)
+    print(f"Stock decreased by {qty} (sold to {customer}).")
+
+
+def damage_goods():
+    show_products()
+    pid = get_product_id()
+    if pid is None:
+        return
+    qty = prompt_int("Quantity damaged: ")
+    if qty <= 0:
+        print("Quantity must be positive.")
+        return
+    c.execute("SELECT stock FROM products WHERE id=?", (pid,))
+    stock = c.fetchone()[0]
+    if stock < qty:
+        print(f"Cannot mark {qty} as damaged — only {stock} in stock.")
+        return
+    c.execute("UPDATE products SET stock = stock - ?, damaged = damaged + ? WHERE id=?", (qty, qty, pid))
+    log_movement(pid, "DAMAGED", qty, "")
+    print(f"{qty} units marked as damaged.")
+
+
+def transfer_location():
+    show_products()
+    pid = get_product_id()
+    if pid is None:
+        return
+    new_location = input("New location (warehouse/rack): ").strip()
+    c.execute("UPDATE products SET location=? WHERE id=?", (new_location, pid))
+    log_movement(pid, "TRANSFER", 0, "", new_location)
+    print(f"Product moved to {new_location}.")
+
+
+def log_movement(pid, mtype, qty, party="", location=""):
+    date = datetime.now().strftime("%Y-%m-%d %H:%M")
+    c.execute("INSERT INTO movements (product_id, type, quantity, party, location, date) VALUES (?, ?, ?, ?, ?, ?)",
+              (pid, mtype, qty, party, location, date))
+    conn.commit()
+
+
+def show_products():
+    c.execute("SELECT * FROM products")
+    rows = c.fetchall()
+    print("\nID | Name | Stock | Damaged | Location")
+    if not rows:
+        print("(no products yet)")
+    for r in rows:
+        print(f"{r[0]} | {r[1]} | {r[2]} | {r[3]} | {r[4]}")
+    print()
+
+
+def show_history():
+    c.execute("""SELECT movements.id, products.name, movements.type, movements.quantity,
+                        movements.party, movements.location, movements.date
+                 FROM movements JOIN products ON movements.product_id = products.id
+                 ORDER BY movements.id DESC LIMIT 20""")
+    rows = c.fetchall()
+    print("\nID | Product | Type | Qty | Party (Supplier/Customer) | Location | Date")
+    if not rows:
+        print("(no movements yet)")
+    for r in rows:
+        print(f"{r[0]} | {r[1]} | {r[2]} | {r[3]} | {r[4]} | {r[5]} | {r[6]}")
+    print()
+
+
+def item_summary_report():
+    c.execute("SELECT id, name, stock, damaged, location FROM products")
+    products = c.fetchall()
+
+    print("\n===== ITEM-WISE SUMMARY REPORT =====")
+    print(f"{'Item':<15}{'Received':<12}{'Sold':<10}{'Damaged':<10}{'Current Stock':<15}{'Location'}")
+    print("-" * 75)
+
+    for pid, name, stock, damaged, location in products:
+        c.execute("SELECT COALESCE(SUM(quantity), 0) FROM movements WHERE product_id=? AND type='RECEIVED'", (pid,))
+        total_received = c.fetchone()[0]
+
+        c.execute("SELECT COALESCE(SUM(quantity), 0) FROM movements WHERE product_id=? AND type='SOLD'", (pid,))
+        total_sold = c.fetchone()[0]
+
+        display_name = name if len(name) <= 14 else name[:11] + "..."
+        print(f"{display_name:<15}{total_received:<12}{total_sold:<10}{damaged:<10}{stock:<15}{location}")
+
+    print("-" * 75)
+    print()
+
+
+# ---------- DASHBOARD ----------
+def dashboard():
+    while True:
+        c.execute("SELECT COUNT(*), SUM(stock), SUM(damaged) FROM products")
+        total_products, total_stock, total_damaged = c.fetchone()
+        total_stock = total_stock or 0
+        total_damaged = total_damaged or 0
+
+        print("\n===== DASHBOARD =====")
+        print(f"Total Products: {total_products or 0}")
+        print(f"Total Stock: {total_stock}")
+        print(f"Total Damaged Goods: {total_damaged}")
+        print("======================")
+        print("1. Add Product")
+        print("2. Receive Goods (Stock IN)")
+        print("3. Sell Goods (Stock OUT)")
+        print("4. Mark Damaged Goods")
+        print("5. Transfer Location")
+        print("6. View All Products")
+        print("7. View Movement History")
+        print("8. Item-wise Summary Report (Arrived vs Sold vs Damaged)")
+        print("9. Logout")
+
+        choice = input("Choose an option: ").strip()
+        if choice == "1":
+            add_product()
+        elif choice == "2":
+            receive_goods()
+        elif choice == "3":
+            sell_goods()
+        elif choice == "4":
+            damage_goods()
+        elif choice == "5":
+            transfer_location()
+        elif choice == "6":
+            show_products()
+        elif choice == "7":
+            show_history()
+        elif choice == "8":
+            item_summary_report()
+        elif choice == "9":
+            print("Logged out.")
+            break
+        else:
+            print("Invalid option.")
+
+
+# ---------- MAIN PROGRAM ----------
+def main():
+    print("WELCOME TO STOCKSENSE")
+    while True:
+        print("\n1. Sign Up")
+        print("2. Sign In")
+        print("3. Exit")
+        choice = input("Choose an option: ").strip()
+
+        if choice == "1":
+            sign_up()
+        elif choice == "2":
+            if sign_in():
+                dashboard()
+        elif choice == "3":
+            print("Goodbye!")
+            break
+        else:
+            print("Invalid option.")
+
+
+if __name__ == "__main__":
+    main()
