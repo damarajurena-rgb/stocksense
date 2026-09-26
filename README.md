@@ -21,8 +21,7 @@ that digitizes stock tracking — replacing manual registers and Excel sheets.
 
 ## How to Run
 ```bash
-pip install -r requirements.txt
-python stocksense.py
+python3 stocksense.py
 ```
 
 ## Database Design
