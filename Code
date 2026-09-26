@@ -18,8 +18,12 @@ c.execute("""CREATE TABLE IF NOT EXISTS users (
 c.execute("""CREATE TABLE IF NOT EXISTS products (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT,
+    sku TEXT UNIQUE,
+    category TEXT,
+    uom TEXT,
     stock INTEGER DEFAULT 0,
     damaged INTEGER DEFAULT 0,
+    reorder_level INTEGER DEFAULT 0,
     location TEXT
 )""")
 
@@ -114,51 +118,149 @@ def sign_in():
     return False
 
 
-# ---------- INVENTORY FUNCTIONS ----------
+def reset_password():
+    """Simplified password reset: generates a one-time code shown on screen
+    (no email/SMS provider wired up, so this substitutes for real OTP delivery)."""
+    email = input("Email: ").strip().lower()
+    c.execute("SELECT id, name FROM users WHERE email=?", (email,))
+    user = c.fetchone()
+    if not user:
+        print("No account with that email.")
+        return
+    print("(In production this code would be emailed/texted as an OTP.)")
+    otp = str(int.from_bytes(os.urandom(2), "big"))[-4:].zfill(4)
+    print(f"Your reset code is: {otp}")
+    entered = input("Enter the code shown above: ").strip()
+    if entered != otp:
+        print("Incorrect code.")
+        return
+    new_password = input("New password: ")
+    if not new_password:
+        print("Password cannot be empty.")
+        return
+    pw_hash, salt = hash_password(new_password)
+    c.execute("UPDATE users SET password_hash=?, salt=? WHERE id=?", (pw_hash, salt, user[0]))
+    conn.commit()
+    print("Password reset successful. Please sign in.")
+
+
+# ---------- PRODUCT MANAGEMENT ----------
 def add_product():
     name = input("Product name: ").strip()
     if not name:
         print("Product name cannot be empty.")
         return
+    sku = input("SKU / Code: ").strip()
+    category = input("Category: ").strip()
+    uom = input("Unit of Measure (e.g. pcs, kg, box): ").strip()
+    initial_stock = prompt_int("Initial stock (0 if none): ")
+    reorder_level = prompt_int("Reorder level (alert threshold): ")
     location = input("Warehouse/Rack location: ").strip()
-    c.execute("INSERT INTO products (name, stock, damaged, location) VALUES (?, 0, 0, ?)", (name, location))
-    conn.commit()
-    print(f"Product '{name}' added at {location}.")
+    try:
+        c.execute(
+            "INSERT INTO products (name, sku, category, uom, stock, damaged, reorder_level, location) "
+            "VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
+            (name, sku, category, uom, initial_stock, reorder_level, location),
+        )
+        conn.commit()
+        print(f"Product '{name}' ({sku}) added at {location}.")
+        if initial_stock > 0:
+            pid = c.execute("SELECT id FROM products WHERE sku=?", (sku,)).fetchone()[0]
+            log_movement(pid, "RECEIVED", initial_stock, "Initial stock")
+    except sqlite3.IntegrityError:
+        print("A product with that SKU already exists.")
 
 
+def search_products():
+    term = input("Search by name, SKU, or category: ").strip()
+    like = f"%{term}%"
+    c.execute(
+        "SELECT id, name, sku, category, stock, reorder_level, location FROM products "
+        "WHERE name LIKE ? OR sku LIKE ? OR category LIKE ?",
+        (like, like, like),
+    )
+    rows = c.fetchall()
+    print("\nID | Name | SKU | Category | Stock | Reorder Lvl | Location")
+    if not rows:
+        print("(no matches)")
+    for r in rows:
+        flag = " ⚠ LOW" if r[4] <= r[5] else ""
+        print(f"{r[0]} | {r[1]} | {r[2]} | {r[3]} | {r[4]} | {r[5]} | {r[6]}{flag}")
+    print()
+
+
+# ---------- OPERATIONS ----------
 def receive_goods():
+    """Receipts: incoming stock from a vendor."""
     show_products()
     pid = get_product_id()
     if pid is None:
         return
+    supplier = input("Supplier: ").strip()
     qty = prompt_int("Quantity received: ")
     if qty <= 0:
         print("Quantity must be positive.")
         return
-    supplier = input("Received from (supplier/vendor name): ").strip()
     c.execute("UPDATE products SET stock = stock + ? WHERE id=?", (qty, pid))
     log_movement(pid, "RECEIVED", qty, supplier)
-    print(f"Stock increased by {qty} (from {supplier}).")
+    print(f"Receipt validated. Stock increased by {qty} (from {supplier}).")
 
 
-def sell_goods():
+def deliver_goods():
+    """Delivery Orders: pick, pack, validate -> stock decreases."""
     show_products()
     pid = get_product_id()
     if pid is None:
         return
-    qty = prompt_int("Quantity sold: ")
+    customer = input("Customer / Sales order for: ").strip()
+    qty = prompt_int("Quantity to pick: ")
     if qty <= 0:
         print("Quantity must be positive.")
         return
-    customer = input("Sold to (customer name): ").strip()
     c.execute("SELECT stock FROM products WHERE id=?", (pid,))
     stock = c.fetchone()[0]
     if stock < qty:
-        print(f"Not enough stock! Only {stock} available.")
+        print(f"Not enough stock to pick! Only {stock} available.")
         return
+    input("Picking items... (press Enter to confirm)")
+    input("Packing items... (press Enter to confirm)")
     c.execute("UPDATE products SET stock = stock - ? WHERE id=?", (qty, pid))
-    log_movement(pid, "SOLD", qty, customer)
-    print(f"Stock decreased by {qty} (sold to {customer}).")
+    log_movement(pid, "DELIVERED", qty, customer)
+    print(f"Delivery validated. Stock decreased by {qty} (delivered to {customer}).")
+
+
+def internal_transfer():
+    """Move stock between locations within the company."""
+    show_products()
+    pid = get_product_id()
+    if pid is None:
+        return
+    c.execute("SELECT location FROM products WHERE id=?", (pid,))
+    old_location = c.fetchone()[0]
+    new_location = input(f"Move from '{old_location}' to: ").strip()
+    c.execute("UPDATE products SET location=? WHERE id=?", (new_location, pid))
+    log_movement(pid, "TRANSFER", 0, f"{old_location} -> {new_location}", new_location)
+    print(f"Transferred from '{old_location}' to '{new_location}'.")
+
+
+def stock_adjustment():
+    """Fix mismatches between recorded stock and a physical count."""
+    show_products()
+    pid = get_product_id()
+    if pid is None:
+        return
+    c.execute("SELECT stock FROM products WHERE id=?", (pid,))
+    recorded = c.fetchone()[0]
+    print(f"Recorded stock: {recorded}")
+    counted = prompt_int("Enter physically counted quantity: ")
+    diff = counted - recorded
+    if diff == 0:
+        print("No mismatch. No adjustment needed.")
+        return
+    c.execute("UPDATE products SET stock=? WHERE id=?", (counted, pid))
+    log_movement(pid, "ADJUSTMENT", diff, f"Recount: {recorded} -> {counted}")
+    direction = "increased" if diff > 0 else "decreased"
+    print(f"Stock {direction} by {abs(diff)} to match physical count ({counted}).")
 
 
 def damage_goods():
@@ -180,17 +282,6 @@ def damage_goods():
     print(f"{qty} units marked as damaged.")
 
 
-def transfer_location():
-    show_products()
-    pid = get_product_id()
-    if pid is None:
-        return
-    new_location = input("New location (warehouse/rack): ").strip()
-    c.execute("UPDATE products SET location=? WHERE id=?", (new_location, pid))
-    log_movement(pid, "TRANSFER", 0, "", new_location)
-    print(f"Product moved to {new_location}.")
-
-
 def log_movement(pid, mtype, qty, party="", location=""):
     date = datetime.now().strftime("%Y-%m-%d %H:%M")
     c.execute("INSERT INTO movements (product_id, type, quantity, party, location, date) VALUES (?, ?, ?, ?, ?, ?)",
@@ -198,24 +289,31 @@ def log_movement(pid, mtype, qty, party="", location=""):
     conn.commit()
 
 
+# ---------- VIEWS / REPORTS ----------
 def show_products():
-    c.execute("SELECT * FROM products")
+    c.execute("SELECT id, name, sku, category, stock, damaged, reorder_level, location FROM products")
     rows = c.fetchall()
-    print("\nID | Name | Stock | Damaged | Location")
+    print("\nID | Name | SKU | Category | Stock | Damaged | Reorder Lvl | Location")
     if not rows:
         print("(no products yet)")
     for r in rows:
-        print(f"{r[0]} | {r[1]} | {r[2]} | {r[3]} | {r[4]}")
+        flag = " ⚠ LOW STOCK" if r[4] <= r[6] else ""
+        print(f"{r[0]} | {r[1]} | {r[2]} | {r[3]} | {r[4]} | {r[5]} | {r[6]} | {r[7]}{flag}")
     print()
 
 
-def show_history():
-    c.execute("""SELECT movements.id, products.name, movements.type, movements.quantity,
-                        movements.party, movements.location, movements.date
-                 FROM movements JOIN products ON movements.product_id = products.id
-                 ORDER BY movements.id DESC LIMIT 20""")
+def show_history(filter_type=None):
+    query = """SELECT movements.id, products.name, movements.type, movements.quantity,
+                      movements.party, movements.location, movements.date
+               FROM movements JOIN products ON movements.product_id = products.id"""
+    params = ()
+    if filter_type:
+        query += " WHERE movements.type=?"
+        params = (filter_type,)
+    query += " ORDER BY movements.id DESC LIMIT 20"
+    c.execute(query, params)
     rows = c.fetchall()
-    print("\nID | Product | Type | Qty | Party (Supplier/Customer) | Location | Date")
+    print("\nID | Product | Type | Qty | Party | Location | Date")
     if not rows:
         print("(no movements yet)")
     for r in rows:
@@ -223,50 +321,65 @@ def show_history():
     print()
 
 
+def filtered_history_menu():
+    print("\nFilter by type: 1) RECEIVED 2) DELIVERED 3) TRANSFER 4) ADJUSTMENT 5) DAMAGED 6) All")
+    choice = input("Choose: ").strip()
+    mapping = {"1": "RECEIVED", "2": "DELIVERED", "3": "TRANSFER", "4": "ADJUSTMENT", "5": "DAMAGED"}
+    show_history(mapping.get(choice))
+
+
 def item_summary_report():
     c.execute("SELECT id, name, stock, damaged, location FROM products")
     products = c.fetchall()
 
     print("\n===== ITEM-WISE SUMMARY REPORT =====")
-    print(f"{'Item':<15}{'Received':<12}{'Sold':<10}{'Damaged':<10}{'Current Stock':<15}{'Location'}")
-    print("-" * 75)
+    print(f"{'Item':<15}{'Received':<12}{'Delivered':<12}{'Damaged':<10}{'Current Stock':<15}{'Location'}")
+    print("-" * 80)
 
     for pid, name, stock, damaged, location in products:
         c.execute("SELECT COALESCE(SUM(quantity), 0) FROM movements WHERE product_id=? AND type='RECEIVED'", (pid,))
         total_received = c.fetchone()[0]
 
-        c.execute("SELECT COALESCE(SUM(quantity), 0) FROM movements WHERE product_id=? AND type='SOLD'", (pid,))
-        total_sold = c.fetchone()[0]
+        c.execute("SELECT COALESCE(SUM(quantity), 0) FROM movements WHERE product_id=? AND type='DELIVERED'", (pid,))
+        total_delivered = c.fetchone()[0]
 
         display_name = name if len(name) <= 14 else name[:11] + "..."
-        print(f"{display_name:<15}{total_received:<12}{total_sold:<10}{damaged:<10}{stock:<15}{location}")
+        print(f"{display_name:<15}{total_received:<12}{total_delivered:<12}{damaged:<10}{stock:<15}{location}")
 
-    print("-" * 75)
+    print("-" * 80)
     print()
 
 
 # ---------- DASHBOARD ----------
 def dashboard():
     while True:
-        c.execute("SELECT COUNT(*), SUM(stock), SUM(damaged) FROM products")
+        c.execute("SELECT COUNT(*), COALESCE(SUM(stock),0), COALESCE(SUM(damaged),0) FROM products")
         total_products, total_stock, total_damaged = c.fetchone()
-        total_stock = total_stock or 0
-        total_damaged = total_damaged or 0
+
+        c.execute("SELECT COUNT(*) FROM products WHERE stock <= reorder_level AND stock > 0")
+        low_stock = c.fetchone()[0]
+
+        c.execute("SELECT COUNT(*) FROM products WHERE stock = 0")
+        out_of_stock = c.fetchone()[0]
 
         print("\n===== DASHBOARD =====")
-        print(f"Total Products: {total_products or 0}")
-        print(f"Total Stock: {total_stock}")
-        print(f"Total Damaged Goods: {total_damaged}")
+        print(f"Total Products:        {total_products}")
+        print(f"Total Stock:           {total_stock}")
+        print(f"Total Damaged Goods:   {total_damaged}")
+        print(f"Low Stock Items:       {low_stock}")
+        print(f"Out of Stock Items:    {out_of_stock}")
         print("======================")
         print("1. Add Product")
-        print("2. Receive Goods (Stock IN)")
-        print("3. Sell Goods (Stock OUT)")
-        print("4. Mark Damaged Goods")
-        print("5. Transfer Location")
-        print("6. View All Products")
-        print("7. View Movement History")
-        print("8. Item-wise Summary Report (Arrived vs Sold vs Damaged)")
-        print("9. Logout")
+        print("2. Receipts (Stock IN from vendor)")
+        print("3. Delivery Order (Stock OUT to customer)")
+        print("4. Internal Transfer")
+        print("5. Stock Adjustment (recount)")
+        print("6. Mark Damaged Goods")
+        print("7. View All Products")
+        print("8. Move History (filterable)")
+        print("9. Search Products (by name / SKU / category)")
+        print("10. Item-wise Summary Report")
+        print("11. Logout")
 
         choice = input("Choose an option: ").strip()
         if choice == "1":
@@ -274,18 +387,22 @@ def dashboard():
         elif choice == "2":
             receive_goods()
         elif choice == "3":
-            sell_goods()
+            deliver_goods()
         elif choice == "4":
-            damage_goods()
+            internal_transfer()
         elif choice == "5":
-            transfer_location()
+            stock_adjustment()
         elif choice == "6":
-            show_products()
+            damage_goods()
         elif choice == "7":
-            show_history()
+            show_products()
         elif choice == "8":
-            item_summary_report()
+            filtered_history_menu()
         elif choice == "9":
+            search_products()
+        elif choice == "10":
+            item_summary_report()
+        elif choice == "11":
             print("Logged out.")
             break
         else:
@@ -298,7 +415,8 @@ def main():
     while True:
         print("\n1. Sign Up")
         print("2. Sign In")
-        print("3. Exit")
+        print("3. Forgot Password")
+        print("4. Exit")
         choice = input("Choose an option: ").strip()
 
         if choice == "1":
@@ -307,6 +425,8 @@ def main():
             if sign_in():
                 dashboard()
         elif choice == "3":
+            reset_password()
+        elif choice == "4":
             print("Goodbye!")
             break
         else:
